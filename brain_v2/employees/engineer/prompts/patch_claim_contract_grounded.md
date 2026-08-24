@@ -1,0 +1,1 @@
+Required JSON fields: change_summary, unified_diff, verification_commands, rollback_plan, limitations, claim_links. claim_links must contain one object per modified file with file, claim_ids, and reason. Each claim_id must name a supplied material claim that justifies the proposed edit.
