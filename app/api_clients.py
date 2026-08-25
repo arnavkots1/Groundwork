@@ -367,7 +367,7 @@ def _extract_agent_cli_text(stdout: str) -> str:
                 return value.strip()
 
     collected: list[str] = []
-    saw_json_line = False
+    json_line_count = 0
     for line in text.splitlines():
         line = line.strip()
         if not line.startswith("{"):
@@ -376,7 +376,7 @@ def _extract_agent_cli_text(stdout: str) -> str:
             event = json.loads(line)
         except json.JSONDecodeError:
             continue
-        saw_json_line = True
+        json_line_count += 1
         if not isinstance(event, dict):
             continue
         for key in ("result", "last_message", "text", "delta"):
@@ -394,7 +394,14 @@ def _extract_agent_cli_text(stdout: str) -> str:
                         collected.append(block["text"])
     if collected:
         return collected[-1].strip() if len(collected) == 1 else "\n".join(collected).strip()
-    if saw_json_line:
+    # A single JSON object with none of the known envelope keys is not a
+    # streaming event we failed to recognize - for a CLI run in plain "text"
+    # output mode (Cursor Agent CLI; no --output-format json/stream-json),
+    # the model's answer is never wrapped in an envelope at all, and every
+    # harness prompt asks for a raw JSON object as the answer itself. Only
+    # discard when *multiple* JSON lines appeared, matching genuine
+    # multi-event streaming output where no single line is the final answer.
+    if json_line_count > 1:
         return ""
     return text
 

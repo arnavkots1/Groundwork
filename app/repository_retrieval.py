@@ -162,6 +162,9 @@ DEFAULT_MAX_TOTAL_CHARS = 8_000
 DEFAULT_MAX_EXCERPTS = 6
 DEFAULT_MAX_FILE_BYTES = 256_000
 DEFAULT_CONTEXT_LINES = 6
+# Match-centered window used in _reference_excerpt_ranges when the enclosing
+# function/class's computed range doesn't actually contain the match.
+MATCH_CENTERED_CONTEXT_LINES = 40
 
 
 def _sha256_bytes(value: bytes) -> str:
@@ -364,11 +367,17 @@ def _iter_files(roots: list[Path], repo_root: Path, file_types: set[str]):
 
 
 def _is_test_path(path: Path) -> bool:
+    # "acceptance" recognizes this project's own convention: scripts/engineer_acceptance.py
+    # is the actual acceptance-test suite (see the dozens of engineer_acceptance eval
+    # artifacts under brain_v2/evals/engineer), but named by what it verifies rather
+    # than the word "test" - the find_tests intent could never match a single line in
+    # it without this, no matter the query, because _matched_lines() gates find_tests
+    # entirely on this naming check before it ever looks at file content.
     lower_parts = {part.lower() for part in path.parts}
     name = path.name.lower()
     return bool(
-        {"test", "tests", "spec", "specs"} & lower_parts
-        or re.search(r"(?:^|[._-])(?:test|spec)(?:[._-]|$)", name)
+        {"test", "tests", "spec", "specs", "acceptance"} & lower_parts
+        or re.search(r"(?:^|[._-])(?:test|spec|acceptance)(?:[._-]|$)", name)
         or name.startswith("test_")
     )
 
@@ -569,11 +578,31 @@ def _reference_excerpt_ranges(
         end = min(total, line + context_lines)
         enclosing = _enclosing_definition_line(lines, line, suffix)
         if enclosing is not None:
-            start = min(start, enclosing)
             if suffix == ".py":
-                end = max(end, _python_body_end(lines, enclosing))
+                body_end = _python_body_end(lines, enclosing)
             elif suffix in {".js", ".jsx", ".mjs", ".ts", ".tsx"}:
-                end = max(end, _brace_body_end(lines, enclosing))
+                body_end = _brace_body_end(lines, enclosing)
+            else:
+                body_end = end
+            # Anchoring every match to a huge enclosing function's declaration
+            # line burns the entire char budget on leading content the match
+            # has nothing to do with, and can leave the excerpt never reaching
+            # the match at all - observed live: a ~2600-line enclosing function
+            # whose first ~185 lines (the only part the char budget could
+            # afford) contained none of the six actual matches.
+            # _python_body_end/_brace_body_end cap their own internal scan at
+            # max_body_lines, so a large real function silently returns a
+            # body_end that is itself already truncated - comparing
+            # (body_end - enclosing) against a span threshold can never detect
+            # that case, since the difference can never exceed the internal
+            # cap either way. The signal that actually works: does the
+            # computed range even contain the match it was supposed to anchor?
+            if enclosing <= line <= body_end:
+                start = min(start, enclosing)
+                end = max(end, body_end)
+            else:
+                start = max(1, line - MATCH_CENTERED_CONTEXT_LINES)
+                end = min(total, line + MATCH_CENTERED_CONTEXT_LINES)
         if ranges and start <= ranges[-1][1] + 1:
             ranges[-1] = (ranges[-1][0], max(ranges[-1][1], end))
         else:
@@ -848,7 +877,13 @@ def run_repository_retrieval(
             ranges = _definition_excerpt_ranges(
                 matches, lines, path.suffix.lower(), context_lines, max_excerpts - excerpts_used
             )
-        elif intent == "find_references":
+        elif intent in ("find_references", "find_tests"):
+            # find_tests matches are almost always "show me the existing test so
+            # I can extend/mimic it" - a fixed ±context_lines window around the
+            # matched line (the generic fallback below) cuts a test function off
+            # mid-body just as surely as it would a reference, for the same
+            # reason _reference_excerpt_ranges already documents: partial
+            # evidence manufactures false incompleteness, not real caution.
             ranges = _reference_excerpt_ranges(
                 matches, lines, path.suffix.lower(), context_lines, max_excerpts - excerpts_used
             )

@@ -25,6 +25,7 @@ excerpts are sent to the configured lead-model provider.
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import hashlib
 import json
 import os
@@ -868,6 +869,43 @@ def run_harness(spec: dict, provider: str = "") -> dict:
 
 # -------------------------------------------------------------------------- report
 
+# Cap on concurrent task processes. Each one spawns its own CLI subprocess
+# (Cursor/Codex/Claude), so this also bounds how many of those run at once -
+# kept modest to stay well under any provider-side concurrency/rate limits.
+MAX_PARALLEL_TASKS = 4
+
+
+def _run_one_task(spec: dict, provider: str, model: str, max_file_chars: int) -> dict:
+    """Run one task's baseline+harness arms to completion. Runs in its own OS
+    process, not a thread: run_harness() temporarily mutates the process-global
+    os.environ["COMPANYBRAIN_PIN_PROVIDER"] for the duration of its call, and
+    concurrent threads sharing one process would clobber each other's pin.
+    Separate processes each get their own environment copy, so this hazard
+    doesn't need to be touched at all to parallelize safely. Each call's
+    disposable checkout already comes from tempfile.mkdtemp() (unique per
+    call, process-safe), so no other shared-state hazard applies here.
+
+    Returns a normal result row, or {"aborted_reason": ...} if quota-exhausted
+    partway through - the caller distinguishes the two by "task_id" absence.
+    """
+    try:
+        baseline = score_arm(run_baseline(spec, provider, model, max_file_chars), spec["selected"], spec)
+        harness = score_arm(run_harness(spec, provider), spec["selected"], spec)
+    except QuotaExhausted as exc:
+        return {"aborted_reason": str(exc)}
+    both_scored = baseline.get("scored") and harness.get("scored")
+    return {
+        "task_id": spec["id"],
+        "task": spec["task"],
+        "selected_files": spec["selected"],
+        "harness_off": baseline,
+        "harness_on": harness,
+        "comparable": bool(both_scored),
+        "harness_wins": bool(both_scored) and harness["score"] > baseline["score"],
+        "tie": bool(both_scored) and harness["score"] == baseline["score"],
+        "blocked_patch_nonempty_on": bool(harness.get("blocked_patch_nonempty")),
+    }
+
 
 def run_benchmark(
     provider: str,
@@ -877,6 +915,7 @@ def run_benchmark(
     max_file_chars: int = BASELINE_MAX_FILE_CHARS,
     repeat: int = 1,
     _artifact_suffix: str = "",
+    parallel: bool = True,
 ) -> dict:
     if repeat < 1:
         raise ValueError("repeat must be at least 1")
@@ -888,6 +927,7 @@ def run_benchmark(
             only=only,
             task_set=task_set,
             max_file_chars=max_file_chars,
+            parallel=parallel,
         )
 
     specs = [s for s in TASK_SETS[task_set] if not only or s["id"] == only]
@@ -896,31 +936,38 @@ def run_benchmark(
     rows = []
     aborted = ""
     tree_before = working_tree_fingerprint(ROOT)
-    for spec in specs:
-        try:
-            baseline = score_arm(run_baseline(spec, provider, model, max_file_chars), spec["selected"], spec)
-        except QuotaExhausted as exc:
-            aborted = str(exc)
-            break
-        try:
-            harness = score_arm(run_harness(spec, provider), spec["selected"], spec)
-        except QuotaExhausted as exc:
-            aborted = str(exc)
-            break
-        both_scored = baseline.get("scored") and harness.get("scored")
-        rows.append(
-            {
-                "task_id": spec["id"],
-                "task": spec["task"],
-                "selected_files": spec["selected"],
-                "harness_off": baseline,
-                "harness_on": harness,
-                "comparable": bool(both_scored),
-                "harness_wins": bool(both_scored) and harness["score"] > baseline["score"],
-                "tie": bool(both_scored) and harness["score"] == baseline["score"],
-                "blocked_patch_nonempty_on": bool(harness.get("blocked_patch_nonempty")),
-            }
-        )
+    # Each task is already fully self-contained - its own run_id, its own
+    # tempfile.mkdtemp() disposable checkout, no shared mutable state that
+    # survives past _run_one_task's own process - so nothing about running
+    # them one at a time was ever load-bearing; it was just how the loop
+    # happened to be written. Parallel execution turns "N tasks * one CLI
+    # call at a time" into "N tasks concurrently", which is the actual
+    # bottleneck given each CLI call is real network-bound wall-clock time.
+    #
+    # parallel=False keeps the original sequential in-process loop, and
+    # exists only so run_deterministic_self_tests() can keep monkeypatching
+    # mod.run_baseline/mod.run_harness the way it always has - a
+    # ProcessPoolExecutor worker re-imports this module fresh in a new
+    # interpreter, so a parent-process monkeypatch never reaches it. This
+    # path is not a fallback for real runs, it is what the self-tests
+    # actually exercise, so it needs to keep working exactly as before.
+    if parallel:
+        max_workers = max(1, min(len(specs), MAX_PARALLEL_TASKS))
+        with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as executor:
+            futures = [executor.submit(_run_one_task, spec, provider, model, max_file_chars) for spec in specs]
+            results = [future.result() for future in futures]
+        for result in results:
+            if "task_id" not in result:
+                aborted = aborted or result.get("aborted_reason", "")
+                continue
+            rows.append(result)
+    else:
+        for spec in specs:
+            result = _run_one_task(spec, provider, model, max_file_chars)
+            if "task_id" not in result:
+                aborted = aborted or result.get("aborted_reason", "")
+                break
+            rows.append(result)
 
     tree_after = working_tree_fingerprint(ROOT)
     if tree_after != tree_before:
@@ -1048,6 +1095,7 @@ def run_repeated_benchmark(
     only: str = "",
     task_set: str = "cheap",
     max_file_chars: int = BASELINE_MAX_FILE_CHARS,
+    parallel: bool = True,
 ) -> dict:
     """Run complete benchmark samples sequentially and summarize score variance."""
     if repeat < 1:
@@ -1065,6 +1113,7 @@ def run_repeated_benchmark(
             max_file_chars=max_file_chars,
             repeat=1,
             _artifact_suffix=f"_run_{run_index:03d}",
+            parallel=parallel,
         )
         complete = _repeat_run_complete(result, len(specs))
         runs.append({"run_index": run_index, "complete": complete, "result": result})
@@ -1270,7 +1319,9 @@ def run_deterministic_self_tests() -> dict:
 
         mod.run_baseline = fake_baseline
         mod.run_harness = fake_harness
-        single = mod.run_benchmark("Stub Provider", "", only="env_loader_precedence", task_set="cheap", repeat=1)
+        single = mod.run_benchmark(
+            "Stub Provider", "", only="env_loader_precedence", task_set="cheap", repeat=1, parallel=False
+        )
         results.append(
             {
                 "id": "repeat_one_single_run_shape",
@@ -1355,7 +1406,9 @@ def run_deterministic_self_tests() -> dict:
 
         mod.run_baseline = ordinary_baseline
         mod.run_harness = ordinary_harness
-        ordinary = mod.run_benchmark("Stub Provider", "", only="env_loader_precedence", task_set="cheap", repeat=1)
+        ordinary = mod.run_benchmark(
+            "Stub Provider", "", only="env_loader_precedence", task_set="cheap", repeat=1, parallel=False
+        )
         results.append(
             {
                 "id": "ordinary_harness_failure_continues",
@@ -1383,7 +1436,7 @@ def run_deterministic_self_tests() -> dict:
 
         mod.run_baseline = quota_baseline
         mod.run_harness = never_harness
-        baseline_abort = mod.run_benchmark("Stub Provider", "", task_set="cheap", repeat=1)
+        baseline_abort = mod.run_benchmark("Stub Provider", "", task_set="cheap", repeat=1, parallel=False)
         results.append(
             {
                 "id": "baseline_quota_aborts_immediately",
@@ -1415,7 +1468,7 @@ def run_deterministic_self_tests() -> dict:
         mod.run_harness = original_harness
         action.engineer_plan = boom_plan  # type: ignore[assignment]
         harness_abort = mod.run_benchmark(
-            "Stub Provider", "", only="env_loader_precedence", task_set="cheap", repeat=1
+            "Stub Provider", "", only="env_loader_precedence", task_set="cheap", repeat=1, parallel=False
         )
         results.append(
             {
@@ -1456,7 +1509,7 @@ def run_deterministic_self_tests() -> dict:
             raise AssertionError("run_repeated_benchmark continued after abort")
 
         mod.run_benchmark = aborting_benchmark  # type: ignore[assignment]
-        repeated = mod.run_repeated_benchmark("Stub", "", repeat=3, task_set="cheap")
+        repeated = mod.run_repeated_benchmark("Stub", "", repeat=3, task_set="cheap", parallel=False)
         results.append(
             {
                 "id": "repeated_benchmark_stops_on_abort",

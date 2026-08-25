@@ -4175,6 +4175,69 @@ print(json.dumps(retrieval_call_budget(manifest)))
         context_outside_envelope_refused_durably,
     )
 
+    def emit_generated_context_request_labels_are_unique() -> tuple[bool, str]:
+        """Regression guard for a real bug: emit_generated_context_request() used
+        to derive request_id purely from run_id (f"ctx_{run_id}"), so the plan
+        stage and every replan/patch-stage call on the same run_id collided -
+        write_context_request(..., create=True) raised "already exists" on the
+        second call, which emit_generated_context_request() silently swallowed
+        into status="invalid" - permanently disqualifying the bounded follow-up
+        round that call was trying to request, with no visible error anywhere.
+        A fully mocked self-test could not have caught this (and didn't): the
+        collision lives in the real on-disk write path, not in any branching
+        logic a mock would exercise. This calls the real function against a
+        real run_id inside the disposable repo, so it fails the same way the
+        original bug did if the per-call label uniqueness ever regresses.
+        """
+        run_id = str(jspace_state.get("run_id") or "")
+        if not run_id:
+            return False, "J-space plan did not produce a run id."
+        code = (
+            "import json, sys\n"
+            "from pathlib import Path\n"
+            "sys.path.insert(0, str(Path('app').resolve()))\n"
+            "from engineer.loop import emit_generated_context_request\n"
+            f"run_id = {run_id!r}\n"
+            "parsed = {'context_requests': [{'item_id': 'x', 'intent': 'find_symbol', 'reason': 'r', 'allowed_roots': ['app']}]}\n"
+            "first = emit_generated_context_request(run_id, parsed, label='acceptance_probe_a') or {}\n"
+            "second = emit_generated_context_request(run_id, parsed, label='acceptance_probe_b') or {}\n"
+            "reused = emit_generated_context_request(run_id, parsed, label='acceptance_probe_a') or {}\n"
+            "print(json.dumps({\n"
+            "  'first_id': first.get('request_id'),\n"
+            "  'second_id': second.get('request_id'),\n"
+            "  'first_status': first.get('status'),\n"
+            "  'second_status': second.get('status'),\n"
+            "  'reused_label_status': reused.get('status'),\n"
+            "  'reused_label_error': reused.get('error'),\n"
+            "}))\n"
+        )
+        result = _run_python(repo, code)
+        payload = result.payload if result.payload else {}
+        if not payload and result.stdout.strip():
+            try:
+                payload = json.loads(result.stdout.strip().splitlines()[-1])
+            except json.JSONDecodeError:
+                payload = {}
+        return (
+            result.returncode == 0
+            and bool(payload.get("first_id"))
+            and bool(payload.get("second_id"))
+            and payload.get("first_id") != payload.get("second_id")
+            and payload.get("first_status") in {"ready", "approval_required"}
+            and payload.get("second_status") in {"ready", "approval_required"}
+            and payload.get("reused_label_status") == "invalid"
+            and "already exists" in str(payload.get("reused_label_error") or "")
+            and str(payload.get("first_id") or "").endswith("acceptance_probe_a")
+            and str(payload.get("second_id") or "").endswith("acceptance_probe_b"),
+            result.detail() if not payload else json.dumps(payload, ensure_ascii=False),
+        )
+
+    add(
+        "emit_generated_context_request_labels_are_unique",
+        "Two emit_generated_context_request calls on the same run_id with different labels never collide",
+        emit_generated_context_request_labels_are_unique,
+    )
+
     return cases
 
 
