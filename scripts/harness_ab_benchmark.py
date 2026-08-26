@@ -363,8 +363,17 @@ FULL_TASKS = [
             "fail loudly at preparation time instead of being silently skipped at execution time."
         ),
         "symbol": "_prepare_verification_commands",
-        "selected": ["scripts/company_brain_action.py", "scripts/smoke_test.py"],
-        "roots": ["scripts"],
+        # prepare_verification_commands() itself lives in app/engineer/verify.py;
+        # scripts/company_brain_action.py only re-exports it
+        # (_prepare_verification_commands = _verify_mod.prepare_verification_commands).
+        # Without the real implementation file in the write scope, the model is
+        # asked to change behavior it structurally cannot write a patch for -
+        # confirmed live: every replan blocked on "prepare_verification_commands
+        # implementation body and return/error semantics" as an unresolved
+        # known_unknown, and roots=["scripts"] meant it could never be retrieved
+        # either.
+        "selected": ["app/engineer/verify.py", "scripts/company_brain_action.py", "scripts/smoke_test.py"],
+        "roots": ["app", "scripts"],
     },
     {
         "id": "stale_source_guard",
@@ -373,12 +382,32 @@ FULL_TASKS = [
             "If any path can reach a write without a fresh-hash check, close it."
         ),
         "symbol": "engineer_apply_patch",
-        "selected": ["scripts/company_brain_action.py"],
-        "roots": ["scripts"],
+        # Same class of misconfiguration found and fixed for verification_quality
+        # in this same commit: the real fresh-hash / stale-context check lives in
+        # app/engineer/apply.py (engineer_apply_patch, called through
+        # app/engineer/api.py's apply_patch), not in
+        # scripts/company_brain_action.py (engineer_apply_patch = api.apply_patch,
+        # a thin re-export). Without the real implementation file in the write
+        # scope, the model cannot write a patch to the code that actually needs
+        # tightening.
+        "selected": ["app/engineer/apply.py", "scripts/company_brain_action.py"],
+        "roots": ["app", "scripts"],
     },
 ]
 
 TASK_SETS: dict[str, list[dict]] = {"cheap": CHEAP_TASKS, "hard": HARD_TASKS, "full": FULL_TASKS}
+
+
+def select_specs(task_set: str, only: str = "") -> list[dict]:
+    """Filter a task set by --only, which accepts one id or a comma-separated
+    list (e.g. "retrieval_broker,verification_quality") - a targeted subset
+    to run together under real parallel dispatch (run_benchmark's
+    ProcessPoolExecutor), not the whole set and not one task run alone.
+    """
+    if not only:
+        return list(TASK_SETS[task_set])
+    wanted = {item.strip() for item in only.split(",") if item.strip()}
+    return [s for s in TASK_SETS[task_set] if s["id"] in wanted]
 
 
 # --------------------------------------------------------------------------- cost
@@ -885,6 +914,20 @@ def _run_one_task(spec: dict, provider: str, model: str, max_file_chars: int) ->
     disposable checkout already comes from tempfile.mkdtemp() (unique per
     call, process-safe), so no other shared-state hazard applies here.
 
+    Baseline and harness are run sequentially, deliberately, even though the
+    two arms don't read each other's output: run_deterministic_self_tests()
+    encodes a real, intentional guarantee that a quota error on baseline means
+    harness is never even attempted (see "baseline_quota_aborts_immediately" -
+    its mock is named never_harness for a reason). Once you know a provider is
+    out of quota, making the second call anyway just spends more of it for a
+    result you're going to discard. A concurrent version was tried and
+    reverted: both calls start before either can signal "stop, we're out,"
+    so the two are fundamentally in tension - concurrency wins on speed,
+    sequential wins on not wasting calls after a known failure. Kept
+    sequential because that failure-path guarantee is the one that matters
+    when it matters (an exhausted or rate-limited provider), not the common
+    case this would have sped up.
+
     Returns a normal result row, or {"aborted_reason": ...} if quota-exhausted
     partway through - the caller distinguishes the two by "task_id" absence.
     """
@@ -930,7 +973,7 @@ def run_benchmark(
             parallel=parallel,
         )
 
-    specs = [s for s in TASK_SETS[task_set] if not only or s["id"] == only]
+    specs = select_specs(task_set, only)
     if task_set == "hard":
         max_file_chars = ensure_selected_files_fit(specs, max_file_chars)
     rows = []
@@ -1101,7 +1144,7 @@ def run_repeated_benchmark(
     if repeat < 1:
         raise ValueError("repeat must be at least 1")
 
-    specs = [s for s in TASK_SETS[task_set] if not only or s["id"] == only]
+    specs = select_specs(task_set, only)
     runs = []
     completed_reports = []
     for run_index in range(1, repeat + 1):
@@ -1655,7 +1698,13 @@ def main() -> int:
     )
     parser.add_argument("--lead-provider", default=os.environ.get("LEAD_PROVIDER", "Codex CLI"))
     parser.add_argument("--lead-model", default=os.environ.get("LEAD_MODEL", ""))
-    parser.add_argument("--only", default="", help="Run a single task id.")
+    parser.add_argument(
+        "--only",
+        default="",
+        help="Run a task id, or a comma-separated list of task ids (e.g. "
+        "'retrieval_broker,verification_quality') to run that subset together "
+        "under real parallel dispatch instead of the whole task set.",
+    )
     parser.add_argument(
         "--task-set",
         choices=sorted(TASK_SETS),
@@ -1681,7 +1730,7 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    specs = [s for s in TASK_SETS[args.task_set] if not args.only or s["id"] == args.only]
+    specs = select_specs(args.task_set, args.only)
     if not specs:
         print(json.dumps({"ok": False, "error": f"No task matched --only {args.only!r}."}))
         return 2
