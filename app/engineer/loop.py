@@ -78,6 +78,59 @@ def emit_generated_context_request(run_id: str, parsed: dict, *, label: str) -> 
         return {"request_id": context_request_id, "status": "invalid", "error": str(exc)[:900]}
 
 
+# Cheap/fast per-provider model used only for the plan stage's own model call.
+# Deliberately not replan or patch: replan re-derives the whole plan against
+# retrieved evidence and is where the real grounding checks (claim_without_evidence,
+# context_incomplete, etc.) live, and patch has to emit an exact unified diff - both
+# are where a weaker model's mistakes actually cost something. Plan's output is
+# fully re-verified by replan against real evidence regardless of how it was
+# produced, so a weaker first guess here is genuinely recoverable downstream, not
+# just assumed to be. Keyed by provider so whichever route call_tier_with_fallback
+# actually picks gets the right override; PLAN_STAGE_CHEAP_MODEL_ENV_VAR mirrors
+# the same per-provider model env vars agent_cli_argv() already reads.
+PLAN_STAGE_CHEAP_MODEL_ENV_VAR: dict[str, str] = {
+    "Cursor Agent CLI": "CURSOR_CLI_MODEL",
+    "Codex CLI": "CODEX_CLI_MODEL",
+    "Claude Code CLI": "CLAUDE_CLI_MODEL",
+}
+PLAN_STAGE_CHEAP_MODEL: dict[str, str] = {
+    "Cursor Agent CLI": "composer-2.5-fast",
+    "Codex CLI": "gpt-5.6-luna",
+    "Claude Code CLI": "claude-haiku-4-5-20251001",
+}
+
+
+class _plan_stage_cheap_model:
+    """Temporarily override every known CLI provider's model env var for the
+    plan-stage call, then restore whatever was there before - same set/restore
+    pattern already used for COMPANYBRAIN_PIN_PROVIDER elsewhere in this codebase.
+    Set for every provider's env var (not just the pinned one) because the caller
+    doesn't know in advance which route call_tier_with_fallback will pick; each
+    provider's var is independent, so this is a normal, harmless no-op for
+    providers not actually used this call.
+    """
+
+    def __init__(self) -> None:
+        self._previous: dict[str, str | None] = {}
+
+    def __enter__(self) -> "_plan_stage_cheap_model":
+        import os
+
+        for provider, env_var in PLAN_STAGE_CHEAP_MODEL_ENV_VAR.items():
+            self._previous[env_var] = os.environ.get(env_var)
+            os.environ[env_var] = PLAN_STAGE_CHEAP_MODEL[provider]
+        return self
+
+    def __exit__(self, *exc_info: object) -> None:
+        import os
+
+        for env_var, value in self._previous.items():
+            if value is None:
+                os.environ.pop(env_var, None)
+            else:
+                os.environ[env_var] = value
+
+
 def engineer_plan(
     task: str,
     selected_files: list[str] | None = None,
@@ -267,15 +320,16 @@ def engineer_plan(
         )
     else:
         try:
-            routed = models.call_tier_with_fallback(
-                "Lead Engineer",
-                prompt,
-                tier=models._engineer_primary_tier(),
-                max_cooldown_wait_seconds=0,
-                cloud_request_timeout_seconds=45,
-                cloud_max_retries=0,
-                max_tokens=3000,
-            )
+            with _plan_stage_cheap_model():
+                routed = models.call_tier_with_fallback(
+                    "Lead Engineer",
+                    prompt,
+                    tier=models._engineer_primary_tier(),
+                    max_cooldown_wait_seconds=0,
+                    cloud_request_timeout_seconds=45,
+                    cloud_max_retries=0,
+                    max_tokens=3000,
+                )
             raw_content = routed.content
             route_attempts = models.attempts_of(routed)
             final_route = models.route_of(routed)

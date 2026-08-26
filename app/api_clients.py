@@ -236,6 +236,21 @@ def cursor_agent_cli_argv(model: str | None = None) -> list[str]:
     ]
 
 
+# CLAUDE_CLI_MODEL / CODEX_CLI_MODEL previously only fed ProviderConfig.model, a
+# cost-ledger label - the CLI itself never received a real --model/-m flag unless
+# the caller wrote a full *_CLI_COMMAND override by hand. Both CLIs support a real
+# model flag (verified: `claude -p --help` / `codex exec --help`), so a per-model
+# env var is wired the same way Cursor's CURSOR_CLI_MODEL already works.
+AGENT_CLI_MODEL_ENV_VAR: dict[str, str] = {
+    "Claude Code CLI": "CLAUDE_CLI_MODEL",
+    "Codex CLI": "CODEX_CLI_MODEL",
+}
+AGENT_CLI_MODEL_FLAG: dict[str, str] = {
+    "Claude Code CLI": "--model",
+    "Codex CLI": "-m",
+}
+
+
 def agent_cli_argv(provider_name: str) -> list[str]:
     """Resolve the argv for an agent CLI provider.
 
@@ -251,7 +266,12 @@ def agent_cli_argv(provider_name: str) -> list[str]:
             return shlex.split(override, posix=True)
         except ValueError:
             return []
-    return list(AGENT_CLI_DEFAULT_ARGV.get(provider_name, []))
+    argv = list(AGENT_CLI_DEFAULT_ARGV.get(provider_name, []))
+    model_env_var = AGENT_CLI_MODEL_ENV_VAR.get(provider_name)
+    model_value = os.environ.get(model_env_var, "").strip() if model_env_var else ""
+    if model_value:
+        argv = [*argv, AGENT_CLI_MODEL_FLAG[provider_name], model_value]
+    return argv
 
 
 def resolve_agent_cli_model_label(provider_name: str) -> str:
