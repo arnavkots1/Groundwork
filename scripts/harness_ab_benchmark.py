@@ -876,7 +876,16 @@ def run_harness(spec: dict, provider: str = "") -> dict:
                 "unified_diff": patch.get("unified_diff") or "",
                 "verification_commands": patch.get("verification_commands") or [],
                 "evidence_trace_present": bool(patch.get("patch_claim_trace")),
-                "model_route": patch.get("model_route"),
+                # Per-stage model routes, not just patch's - the plan stage can run
+                # a different (cheaper) model than replan/patch (see
+                # engineer/loop.py's _plan_stage_cheap_model), and this is the only
+                # place that was otherwise visible without manually cross-referencing
+                # the run/replan/patch artifacts on disk by hand.
+                "model_routing": {
+                    "plan": plan.get("final_route"),
+                    "replan": replan.get("modelRoute"),
+                    "patch": patch.get("model_route"),
+                },
             }
         )
     except Exception as exc:  # noqa: BLE001

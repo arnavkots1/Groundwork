@@ -353,6 +353,7 @@ def _engineer_replan_once(run_id: str) -> dict:
         "checkerStatus": checker_report["status"],
         "failedRules": checker_report.get("failed_rules") or [],
         "contextSufficiency": grounding["latest_context_sufficiency"],
+        "modelRoute": route,
         "materialClaims": parsed.get("material_claims") or [],
         "planActions": parsed.get("plan_actions") or [],
         "generatedContextRequest": emit_generated_context_request(source_run_id, parsed, label=f"replan_{revision_id}"),

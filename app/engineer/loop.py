@@ -93,11 +93,22 @@ PLAN_STAGE_CHEAP_MODEL_ENV_VAR: dict[str, str] = {
     "Codex CLI": "CODEX_CLI_MODEL",
     "Claude Code CLI": "CLAUDE_CLI_MODEL",
 }
+# Hardcoded fallback only - PLAN_STAGE_MODEL_OVERRIDE_ENV_VAR below lets a caller
+# pick a different cheap model per provider (or disable routing entirely) without
+# editing source, same as every other model choice in this codebase is tunable.
 PLAN_STAGE_CHEAP_MODEL: dict[str, str] = {
     "Cursor Agent CLI": "composer-2.5-fast",
     "Codex CLI": "gpt-5.6-luna",
     "Claude Code CLI": "claude-haiku-4-5-20251001",
 }
+PLAN_STAGE_MODEL_OVERRIDE_ENV_VAR: dict[str, str] = {
+    "Cursor Agent CLI": "PLAN_STAGE_MODEL_CURSOR",
+    "Codex CLI": "PLAN_STAGE_MODEL_CODEX",
+    "Claude Code CLI": "PLAN_STAGE_MODEL_CLAUDE",
+}
+# Set to disable plan-stage model routing entirely (plan then uses whatever model
+# replan/patch use) - e.g. for a controlled A/B comparison of the routing itself.
+DISABLE_PLAN_STAGE_CHEAP_MODEL_ENV_VAR = "DISABLE_PLAN_STAGE_CHEAP_MODEL"
 
 
 class _plan_stage_cheap_model:
@@ -108,21 +119,34 @@ class _plan_stage_cheap_model:
     doesn't know in advance which route call_tier_with_fallback will pick; each
     provider's var is independent, so this is a normal, harmless no-op for
     providers not actually used this call.
+
+    DISABLE_PLAN_STAGE_CHEAP_MODEL=1 makes __enter__/__exit__ a true no-op (no
+    env var touched, not even a no-op set/restore), for a clean controlled
+    comparison against routing turned on.
     """
 
     def __init__(self) -> None:
+        import os
+
+        self._disabled = bool(os.environ.get(DISABLE_PLAN_STAGE_CHEAP_MODEL_ENV_VAR, "").strip())
         self._previous: dict[str, str | None] = {}
 
     def __enter__(self) -> "_plan_stage_cheap_model":
         import os
 
+        if self._disabled:
+            return self
         for provider, env_var in PLAN_STAGE_CHEAP_MODEL_ENV_VAR.items():
             self._previous[env_var] = os.environ.get(env_var)
-            os.environ[env_var] = PLAN_STAGE_CHEAP_MODEL[provider]
+            override_var = PLAN_STAGE_MODEL_OVERRIDE_ENV_VAR[provider]
+            os.environ[env_var] = os.environ.get(override_var, "").strip() or PLAN_STAGE_CHEAP_MODEL[provider]
         return self
 
     def __exit__(self, *exc_info: object) -> None:
         import os
+
+        if self._disabled:
+            return
 
         for env_var, value in self._previous.items():
             if value is None:
@@ -602,6 +626,11 @@ def _repair_plan(
             "original_plan": json.dumps(original_plan, ensure_ascii=False, indent=2),
         },
     )
+    # Deliberately NOT wrapped in _plan_stage_cheap_model: fixing a plan that
+    # already failed the checker needs real reasoning about why it failed, not a
+    # cheap first guess - unlike the initial plan, there's no later grounded-replan
+    # stage that re-derives this from scratch against evidence to catch a weak
+    # repair attempt.
     routed = models.call_tier_with_fallback(
         "Lead Engineer",
         prompt,

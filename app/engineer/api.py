@@ -77,6 +77,7 @@ from .replan import engineer_replan as _engineer_replan
 from .envelope import declare_task_envelope as _declare_task_envelope
 from .patch import engineer_patch as _engineer_patch
 from .prompts import PromptError
+from .trajectory import engineer_trajectory as _engineer_trajectory
 from .retrieval import (
     engineer_context_approve as _engineer_context_approve,
     engineer_context_execute as _engineer_context_execute,
@@ -412,6 +413,25 @@ def recheck_plan(run_id: str, write: bool = False) -> dict:
     Returns `checkerStatus`, `warnings`, `failedRules`, `suggestedCorrections`.
     """
     return _engineer_check_run(run_id, write=write)
+
+
+def trajectory(run_id: str, save: bool = False) -> dict:
+    """One consolidated, chronological, human-readable view of a run's
+    plan -> retrieve -> replan -> patch chain.
+
+    Preconditions: `run_id` names a J-space workspace that exists.
+
+    Writes: nothing unless `save=True`, which writes trajectory.md/.json into the
+    run's own j_space workspace. This is a read-only reporting tool built entirely
+    from the manifest's existing events/artifact_refs - it never writes into the
+    manifest itself, so running it can never affect a run's own provenance record.
+
+    Gate: none.
+
+    Returns `steps` (chronological), `final_patch_status`, and `output` (the
+    rendered markdown narrative).
+    """
+    return _engineer_trajectory(run_id, save=save)
 
 
 def replan_with_evidence(run_id: str) -> dict:

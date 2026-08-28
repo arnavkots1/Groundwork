@@ -134,7 +134,7 @@ def _pin_provider_from_cli(provider: str, model_id: str = "") -> None:
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
-    parser.add_argument("action", choices=["status", "engineer-task", "engineer-plan", "engineer-envelope-declare", "engineer-autonomous-run", "engineer-retrieve", "engineer-context-request", "engineer-context-approve", "engineer-context-execute", "engineer-context-invalidate", "engineer-repo-map", "engineer-replan", "engineer-check-run", "engineer-review", "engineer-patch", "engineer-patch-review", "engineer-apply-patch", "engineer-revert-applied-patch", "engineer-trial-patch", "engineer-verify", "engineer-feedback", "engineer-approve-lesson", "engineer-validate-behavior-promotion", "engineer-rollback-behavior", "engineer-reject-lesson", "engineer-version", "run-summary", "engineer-summarize-run", "model-registry", "model-registry-refresh", "model-probe", "call-agent", "read-file", "read-run", "list-runs", "save-outbox", "list-nvidia-models"])
+    parser.add_argument("action", choices=["status", "engineer-task", "engineer-plan", "engineer-envelope-declare", "engineer-autonomous-run", "engineer-retrieve", "engineer-context-request", "engineer-context-approve", "engineer-context-execute", "engineer-context-invalidate", "engineer-repo-map", "engineer-replan", "engineer-check-run", "engineer-review", "engineer-patch", "engineer-patch-review", "engineer-apply-patch", "engineer-revert-applied-patch", "engineer-trial-patch", "engineer-verify", "engineer-feedback", "engineer-approve-lesson", "engineer-validate-behavior-promotion", "engineer-rollback-behavior", "engineer-reject-lesson", "engineer-version", "run-summary", "engineer-summarize-run", "engineer-trajectory", "model-registry", "model-registry-refresh", "model-probe", "call-agent", "read-file", "read-run", "list-runs", "save-outbox", "list-nvidia-models"])
     parser.add_argument("--provider", default="Best Available")
     parser.add_argument("--role", default="CEO")
     parser.add_argument("--prompt", default="")
@@ -296,6 +296,8 @@ def _dispatch(args: argparse.Namespace) -> dict:
         return api.replan_with_evidence(args.run_id or args.task_id or args.target)
     if action == "engineer-check-run":
         return api.recheck_plan(args.run_id or args.target or args.prompt, write=args.write)
+    if action == "engineer-trajectory":
+        return api.trajectory(args.run_id or args.task_id or args.target, save=args.save)
     if action == "engineer-review":
         return api.record_review(
             args.run_id or args.target,

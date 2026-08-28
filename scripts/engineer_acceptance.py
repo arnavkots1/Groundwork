@@ -4238,6 +4238,163 @@ print(json.dumps(retrieval_call_budget(manifest)))
         emit_generated_context_request_labels_are_unique,
     )
 
+    def agent_cli_model_env_vars_produce_real_flags() -> tuple[bool, str]:
+        """CLAUDE_CLI_MODEL / CODEX_CLI_MODEL used to only feed a cost-ledger
+        label (ProviderConfig.model) - the CLI itself never received a real
+        --model/-m flag unless the caller hand-wrote a full *_CLI_COMMAND
+        override. This is what the plan-stage cheap-model routing actually
+        depends on: if these env vars stopped producing a real flag, routing
+        would silently become a no-op (still call the CLI, just with its
+        default model) with no error anywhere to notice it.
+        """
+        code = (
+            "import json, sys, os\n"
+            "from pathlib import Path\n"
+            "sys.path.insert(0, str(Path('app').resolve()))\n"
+            "import api_clients\n"
+            "for var in ('CLAUDE_CLI_MODEL', 'CODEX_CLI_MODEL', 'CLAUDE_CLI_COMMAND', 'CODEX_CLI_COMMAND'):\n"
+            "    os.environ.pop(var, None)\n"
+            "no_override_codex = api_clients.agent_cli_argv('Codex CLI')\n"
+            "no_override_claude = api_clients.agent_cli_argv('Claude Code CLI')\n"
+            "os.environ['CODEX_CLI_MODEL'] = 'gpt-5.6-luna'\n"
+            "os.environ['CLAUDE_CLI_MODEL'] = 'claude-haiku-4-5-20251001'\n"
+            "codex_argv = api_clients.agent_cli_argv('Codex CLI')\n"
+            "claude_argv = api_clients.agent_cli_argv('Claude Code CLI')\n"
+            "print(json.dumps({\n"
+            "  'no_override_codex_has_model_flag': '-m' in no_override_codex,\n"
+            "  'no_override_claude_has_model_flag': '--model' in no_override_claude,\n"
+            "  'codex_argv': codex_argv,\n"
+            "  'claude_argv': claude_argv,\n"
+            "}))\n"
+        )
+        result = _run_python(repo, code)
+        payload = result.payload if result.payload else {}
+        if not payload and result.stdout.strip():
+            try:
+                payload = json.loads(result.stdout.strip().splitlines()[-1])
+            except json.JSONDecodeError:
+                payload = {}
+        codex_argv = payload.get("codex_argv") or []
+        claude_argv = payload.get("claude_argv") or []
+
+        def _flag_value(argv: list, flag: str) -> str:
+            return argv[argv.index(flag) + 1] if flag in argv and argv.index(flag) + 1 < len(argv) else ""
+
+        return (
+            result.returncode == 0
+            and payload.get("no_override_codex_has_model_flag") is False
+            and payload.get("no_override_claude_has_model_flag") is False
+            and _flag_value(codex_argv, "-m") == "gpt-5.6-luna"
+            and _flag_value(claude_argv, "--model") == "claude-haiku-4-5-20251001",
+            result.detail() if not payload else json.dumps(payload, ensure_ascii=False),
+        )
+
+    add(
+        "agent_cli_model_env_vars_produce_real_flags",
+        "CODEX_CLI_MODEL/CLAUDE_CLI_MODEL reach the CLI as a real --model/-m flag, not just a cost-ledger label",
+        agent_cli_model_env_vars_produce_real_flags,
+    )
+
+    def plan_stage_cheap_model_isolated_and_restores() -> tuple[bool, str]:
+        """Regression guard for the per-stage model routing itself: the plan
+        stage's cheap-model override must apply during the call and fully
+        restore afterward, including the case where a provider's model env
+        var was unset before the call (must pop, not leave a stray empty
+        override that would silently affect later real calls).
+        """
+        code = (
+            "import json, sys, os\n"
+            "from pathlib import Path\n"
+            "sys.path.insert(0, str(Path('app').resolve()))\n"
+            "os.environ['CURSOR_CLI_MODEL'] = 'composer-2.5'\n"
+            "os.environ.pop('CODEX_CLI_MODEL', None)\n"
+            "from engineer.loop import _plan_stage_cheap_model\n"
+            "before = {\n"
+            "    'cursor': os.environ.get('CURSOR_CLI_MODEL'),\n"
+            "    'codex': os.environ.get('CODEX_CLI_MODEL'),\n"
+            "}\n"
+            "with _plan_stage_cheap_model():\n"
+            "    during = {\n"
+            "        'cursor': os.environ.get('CURSOR_CLI_MODEL'),\n"
+            "        'codex': os.environ.get('CODEX_CLI_MODEL'),\n"
+            "        'claude': os.environ.get('CLAUDE_CLI_MODEL'),\n"
+            "    }\n"
+            "after = {\n"
+            "    'cursor': os.environ.get('CURSOR_CLI_MODEL'),\n"
+            "    'codex': os.environ.get('CODEX_CLI_MODEL'),\n"
+            "    'codex_key_present': 'CODEX_CLI_MODEL' in os.environ,\n"
+            "}\n"
+            "print(json.dumps({'before': before, 'during': during, 'after': after}))\n"
+        )
+        result = _run_python(repo, code)
+        payload = result.payload if result.payload else {}
+        if not payload and result.stdout.strip():
+            try:
+                payload = json.loads(result.stdout.strip().splitlines()[-1])
+            except json.JSONDecodeError:
+                payload = {}
+        during = payload.get("during") or {}
+        after = payload.get("after") or {}
+        return (
+            result.returncode == 0
+            and during.get("cursor") == "composer-2.5-fast"
+            and during.get("codex") == "gpt-5.6-luna"
+            and during.get("claude") == "claude-haiku-4-5-20251001"
+            and after.get("cursor") == "composer-2.5"
+            and after.get("codex_key_present") is False,
+            result.detail() if not payload else json.dumps(payload, ensure_ascii=False),
+        )
+
+    add(
+        "plan_stage_cheap_model_isolated_and_restores",
+        "Plan-stage cheap-model override applies during the call and fully restores afterward (including popping a var that was unset before)",
+        plan_stage_cheap_model_isolated_and_restores,
+    )
+
+    def limitations_string_from_model_does_not_get_shredded_into_characters() -> tuple[bool, str]:
+        """Regression guard for a real bug found via the new trajectory report
+        (app/engineer/trajectory.py) on its very first real run: a committed
+        patch artifact's "limitations" field was a list of 42 individual
+        characters instead of a real sentence. Root cause: a model returned
+        "limitations" as a plain string instead of a JSON array, and
+        `[*that_string, "new item"]` (used before generating the final
+        payload) iterates a string character by character, not as one item.
+        _normalize_limitations() is the single place this is now coerced.
+        """
+        code = (
+            "import json, sys\n"
+            "from pathlib import Path\n"
+            "sys.path.insert(0, str(Path('app').resolve()))\n"
+            "from engineer.patch import _normalize_limitations\n"
+            "print(json.dumps({\n"
+            "  'from_string': _normalize_limitations('Model returned this as one string instead of an array.'),\n"
+            "  'from_list': _normalize_limitations(['a', 'b', '']),\n"
+            "  'from_none': _normalize_limitations(None),\n"
+            "  'from_empty_string': _normalize_limitations(''),\n"
+            "}))\n"
+        )
+        result = _run_python(repo, code)
+        payload = result.payload if result.payload else {}
+        if not payload and result.stdout.strip():
+            try:
+                payload = json.loads(result.stdout.strip().splitlines()[-1])
+            except json.JSONDecodeError:
+                payload = {}
+        return (
+            result.returncode == 0
+            and payload.get("from_string") == ["Model returned this as one string instead of an array."]
+            and payload.get("from_list") == ["a", "b"]
+            and payload.get("from_none") == []
+            and payload.get("from_empty_string") == [],
+            result.detail() if not payload else json.dumps(payload, ensure_ascii=False),
+        )
+
+    add(
+        "limitations_string_from_model_does_not_get_shredded_into_characters",
+        "A model returning limitations as a plain string is coerced to a one-item list, not shredded into individual characters",
+        limitations_string_from_model_does_not_get_shredded_into_characters,
+    )
+
     return cases
 
 

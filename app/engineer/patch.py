@@ -358,6 +358,25 @@ def extract_unified_diff(text: str) -> str:
     return text[start:].strip() if start != -1 else ""
 
 
+def _normalize_limitations(raw_limitations: object) -> list[str]:
+    """Coerce a model's "limitations" field to a real list of strings.
+
+    A model that returns "limitations" as a single string rather than a JSON
+    array (a real, observed output-shape deviation, not hypothetical - found via
+    a committed patch artifact whose limitations field was a list of individual
+    characters) silently gets shredded downstream: every consumer of this field
+    does `[*generated.get("limitations", []), ...]` / `dedupe([*...])`, and
+    unpacking a string with `*` iterates its characters one at a time.
+    """
+    if isinstance(raw_limitations, str):
+        return [raw_limitations] if raw_limitations.strip() else []
+    if isinstance(raw_limitations, list):
+        return [str(item) for item in raw_limitations if str(item).strip()]
+    if raw_limitations:
+        return [str(raw_limitations)]
+    return []
+
+
 def generate_patch_with_model(
     plan: dict,
     selected_records: list[dict],
@@ -425,6 +444,9 @@ def generate_patch_with_model(
         }
     parsed["model_route"] = models.route_of(routed)
     parsed["model_attempts"] = models.attempts_of(routed)
+    # Normalize once, here, so every downstream consumer of "limitations" can
+    # assume a real list of strings - see _normalize_limitations's docstring.
+    parsed["limitations"] = _normalize_limitations(parsed.get("limitations"))
     return parsed
 
 
