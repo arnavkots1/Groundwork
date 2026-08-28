@@ -1730,7 +1730,7 @@ def main() -> int:
         "--repeat",
         type=_positive_int,
         default=1,
-        help="Run each selected benchmark task this many times sequentially.",
+        help="Run the full selected benchmark this many times sequentially; within each repeat, selected tasks run concurrently.",
     )
     parser.add_argument(
         "--dry-run",
