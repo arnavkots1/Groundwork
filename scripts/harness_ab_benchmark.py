@@ -1333,6 +1333,15 @@ def run_deterministic_self_tests() -> dict:
     original_harness = mod.run_harness
     original_benchmark = mod.run_benchmark
     original_plan = action.engineer_plan
+    # run_benchmark() and the repeat path always write a JSON+MD report pair to
+    # EVAL_DIR. Under the self-tests those reports are Stub Provider byproducts,
+    # not evidence, and landing them in brain_v2/evals/engineer/ meant they got
+    # committed by accident (see f0db13d). Point EVAL_DIR at a throwaway
+    # directory for the duration, the same way the suite monkeypatches
+    # run_baseline/run_harness, and delete it in the finally block.
+    original_eval_dir = mod.EVAL_DIR
+    stub_eval_dir = Path(tempfile.mkdtemp(prefix="harness_ab_selftest_reports_"))
+    mod.EVAL_DIR = stub_eval_dir
 
     try:
         base = estimate_run(CHEAP_TASKS, BASELINE_MAX_FILE_CHARS, repeat=1)
@@ -1686,6 +1695,8 @@ def run_deterministic_self_tests() -> dict:
         mod.run_harness = original_harness
         mod.run_benchmark = original_benchmark
         action.engineer_plan = original_plan  # type: ignore[assignment]
+        mod.EVAL_DIR = original_eval_dir
+        shutil.rmtree(stub_eval_dir, ignore_errors=True)
 
     passed = sum(1 for item in results if item["ok"])
     return {
